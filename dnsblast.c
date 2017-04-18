@@ -1,8 +1,11 @@
 
 #include "dnsblast.h"
 
+#define DO_RECEIVE 1
+
 /* this needs the leading dot */
 static const char * domain_name = ".com";
+
 
 static unsigned long long
 get_nanoseconds(void)
@@ -372,13 +375,17 @@ main(int argc, char *argv[])
         }
         type = get_random_type();
         blast(&context, name, type);
-        throttled_receive(&context);
+	if (DO_RECEIVE) {
+	  throttled_receive(&context); 
+	}
     } while (--send_count > 0UL);
     update_status(&context);
 
     context.sending = 0;
-    while (context.sent_packets != context.received_packets) {
+    if (DO_RECEIVE) {
+      while (context.sent_packets != context.received_packets) {
         throttled_receive(&context);
+      }
     }
     freeaddrinfo(ai);
     assert(close(sock) == 0);
