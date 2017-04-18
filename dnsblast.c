@@ -4,7 +4,7 @@
 #define DO_RECEIVE 1
 
 /* this needs the leading dot */
-static const char * domain_name = ".com";
+static const char * domain_name = DEFAULT_DOMAIN;
 
 
 static unsigned long long
@@ -129,8 +129,22 @@ blast(Context * const context, const char * const name, const uint16_t type)
 static void
 usage(void) {
   fprintf(stderr,
-	  "\nUsage: "
-	  "dnsblast [-F] [-c <count>] [-p <port>] [-r <rate>] <host>\n");
+	  "\nUsage:\n"
+	  "\tdnsblast [-F] [-c <count>] [-d <domain_name>] [-p <port>]\n"
+	  "\t\t[-r <rate>] <host>\n");
+  fprintf(stderr, 
+	  "\twhere:\n"
+	  "\t\t-F\t\tuse fuzzing\n"
+	  "\t\t-c <count>\tquery count (default is MAX_INT)\n"
+	  "\t\t-d <domain_name>\n"
+	  "\t\t\t\tAll queries will be for names under the\n"
+	  "\t\t\t\tspecified domain (must begin with a dot).\n"
+	  "\t\t\t\tThe default is \"%s\"\n"
+	  "\t\t-p <port>\tdestination port number or name\n"
+	  "\t\t-r <rate>\trate in packets per second\n"
+	  "\tand:\n"
+	  "\t\t<host>\t\tIP or FQDN\n",
+	  DEFAULT_DOMAIN);
     exit(EXIT_SUCCESS);
 }
 
@@ -344,7 +358,7 @@ main(int argc, char *argv[])
     int              ch;
     char             *endptr;
 
-    while ((ch = getopt(argc, argv, "c:Fp:r:")) != -1) {
+    while ((ch = getopt(argc, argv, "c:d:Fp:r:")) != -1) {
       switch (ch) {
       case 'c':
         if ((optarg == NULL) || (*optarg == '\0')) {
@@ -357,6 +371,19 @@ main(int argc, char *argv[])
 	  exit(1);
 	}
 	break;
+
+      case 'd':
+        if ((optarg == NULL) || (*optarg == '\0')) {
+	  fprintf(stderr, "-d flag requires a domain name\n");
+	  exit(1);
+	}
+	if (optarg[0] != '.') {
+	  fprintf(stderr, "the domain name must include the leading dot\n");
+	  exit(1);
+	}
+	domain_name = optarg;
+	break;
+
 
       case 'F':
 	fuzz = 1;

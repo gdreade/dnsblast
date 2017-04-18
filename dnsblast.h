@@ -37,6 +37,8 @@
 # define MAX_UDP_BUFFER_SIZE  (16 * 1024 * 1024)
 #endif
 
+#define DEFAULT_DOMAIN ".com"
+
 #define REPEATED_NAME_PROBABILITY (int) ((RAND_MAX * 13854LL) / 100000LL)
 #define REFUZZ_PROBABILITY (int) ((RAND_MAX * 500LL) / 100000LL)
 
