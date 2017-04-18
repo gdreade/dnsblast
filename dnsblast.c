@@ -128,7 +128,9 @@ blast(Context * const context, const char * const name, const uint16_t type)
 
 static void
 usage(void) {
-    puts("\nUsage: dnsblast [fuzz] <host> [<count>] [<pps>] [<port>]\n");
+  fprintf(stderr,
+	  "\nUsage: "
+	  "dnsblast [-F] [-c <count>] [-p <port>] [-r <rate>] <host>\n");
     exit(EXIT_SUCCESS);
 }
 
@@ -339,28 +341,60 @@ main(int argc, char *argv[])
     int              sock;
     uint16_t         type;
     _Bool            fuzz = 0;
+    int              ch;
+    char             *endptr;
 
-    if (argc < 2 || argc > 6) {
-        usage();
+    while ((ch = getopt(argc, argv, "c:Fp:r:")) != -1) {
+      switch (ch) {
+      case 'c':
+        if ((optarg == NULL) || (*optarg == '\0')) {
+	  fprintf(stderr, "-c flag requires an integer query count\n");
+	  exit(1);
+	}
+	send_count = strtoul(optarg, &endptr, 10);
+	if (*endptr != '\0') {
+	  fprintf(stderr, "invalid count for -c flag\n");
+	  exit(1);
+	}
+	break;
+
+      case 'F':
+	fuzz = 1;
+	break;
+
+      case 'p':
+        if ((optarg == NULL) || (*optarg == '\0')) {
+	  fprintf(stderr, "-p flag requires a port number or name\n");
+	  exit(1);
+	}
+	port = optarg;
+	break;
+
+      case 'r':
+        if ((optarg == NULL) || (*optarg == '\0')) {
+	  fprintf(stderr,
+		  "-r flag requires an integer rate in packets per second\n");
+	  exit(1);
+	}
+	pps = strtoul(optarg, &endptr, 10);
+	if (*endptr != '\0') {
+	  fprintf(stderr, "invalid rate for -r flag\n");
+	  exit(1);
+	}
+	break;
+
+      default:
+	usage();
+      }
     }
-    if (strcasecmp(argv[1], "fuzz") == 0) {
-        fuzz = 1;
-        argv++;
-        argc--;
-    }
+    argc -= optind;
+    argv += optind;
+
     if (argc < 1) {
         usage();
     }
-    host = argv[1];
-    if (argc > 2) {
-        send_count = strtoul(argv[2], NULL, 10);
-    }
-    if (argc > 3) {
-        pps = strtoul(argv[3], NULL, 10);
-    }
-    if (argc > 4) {
-        port = argv[4];
-    }
+    host = argv[0];
+
     if ((sock = get_sock(host, port, &ai)) == -1) {
         perror("Oops");
         exit(EXIT_FAILURE);
