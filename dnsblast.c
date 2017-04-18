@@ -1,8 +1,6 @@
 
 #include "dnsblast.h"
 
-#define DO_RECEIVE 1
-
 /* this needs the leading dot */
 static const char * domain_name = DEFAULT_DOMAIN;
 
@@ -130,7 +128,7 @@ static void
 usage(void) {
   fprintf(stderr,
 	  "\nUsage:\n"
-	  "\tdnsblast [-F] [-c <count>] [-d <domain_name>] [-p <port>]\n"
+	  "\tdnsblast [-Fn] [-c <count>] [-d <domain_name>] [-p <port>]\n"
 	  "\t\t[-r <rate>] <host>\n");
   fprintf(stderr, 
 	  "\twhere:\n"
@@ -140,6 +138,7 @@ usage(void) {
 	  "\t\t\t\tAll queries will be for names under the\n"
 	  "\t\t\t\tspecified domain (must begin with a dot).\n"
 	  "\t\t\t\tThe default is \"%s\"\n"
+	  "\t\t-n\t\tDo not wait to receive return packets.\n"
 	  "\t\t-p <port>\tdestination port number or name\n"
 	  "\t\t-r <rate>\trate in packets per second\n"
 	  "\tand:\n"
@@ -357,8 +356,9 @@ main(int argc, char *argv[])
     _Bool            fuzz = 0;
     int              ch;
     char             *endptr;
+    int              do_receive = 1;
 
-    while ((ch = getopt(argc, argv, "c:d:Fp:r:")) != -1) {
+    while ((ch = getopt(argc, argv, "c:d:Fnp:r:")) != -1) {
       switch (ch) {
       case 'c':
         if ((optarg == NULL) || (*optarg == '\0')) {
@@ -387,6 +387,10 @@ main(int argc, char *argv[])
 
       case 'F':
 	fuzz = 1;
+	break;
+
+      case 'n':
+	do_receive = 0;
 	break;
 
       case 'p':
@@ -436,14 +440,14 @@ main(int argc, char *argv[])
         }
         type = get_random_type();
         blast(&context, name, type);
-	if (DO_RECEIVE) {
+	if (do_receive) {
 	  throttled_receive(&context); 
 	}
     } while (--send_count > 0UL);
     update_status(&context);
 
     context.sending = 0;
-    if (DO_RECEIVE) {
+    if (do_receive) {
       while (context.sent_packets != context.received_packets) {
         throttled_receive(&context);
       }
