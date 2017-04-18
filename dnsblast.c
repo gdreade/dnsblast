@@ -1,6 +1,9 @@
 
 #include "dnsblast.h"
 
+/* this needs the leading dot */
+static const char * domain_name = ".com";
+
 static unsigned long long
 get_nanoseconds(void)
 {
@@ -149,14 +152,18 @@ get_random_name(char * const name, size_t name_size)
 {
     const char charset_alnum[36] = "abcdefghijklmnopqrstuvwxyz0123456789";
 
-    assert(name_size > (size_t) 8U);
+    size_t random_char_count = 4;
+    size_t needed = random_char_count + strlen(domain_name) + 1;
+
+    assert(name_size > needed);
     const int r1 = rand(), r2 = rand();
     name[0] = charset_alnum[(r1) % sizeof charset_alnum];
     name[1] = charset_alnum[(r1 >> 16) % sizeof charset_alnum];
     name[2] = charset_alnum[(r2) % sizeof charset_alnum];
     name[3] = charset_alnum[(r2 >> 16) % sizeof charset_alnum];
-    name[4] = '.';    name[5] = 'c';    name[6] = 'o';    name[7] = 'm';
-    name[8] = 0;
+
+    char * const p = name + random_char_count;
+    strcpy(p, domain_name);
 
     return 0;
 }
