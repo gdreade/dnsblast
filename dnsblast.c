@@ -653,9 +653,11 @@ main(int argc, char *argv[])
         }
         type = get_random_type();
         blast(&context, name, type);
-	if (do_receive) {
-            throttled_receive(&context); 
-        }
+	/* 
+	 * we need to do throttled_receive there even if do_receive is zero
+	 * because it is how we control the rate
+	 */
+	throttled_receive(&context); 
     } while (--send_count > 0UL);
     update_status(&context);
 
