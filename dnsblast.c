@@ -1,6 +1,8 @@
 
 #include "dnsblast.h"
 
+#define NANOS_PER_SECOND 1000000000ULL
+
 /* this needs the leading dot */
 static const char * domain_name = DEFAULT_DOMAIN;
 
@@ -424,7 +426,7 @@ update_status(const Context * const context)
     const unsigned long long now = get_nanoseconds();
     const unsigned long long elapsed = now - context->startup_date;
     unsigned long long rate =
-        context->received_packets * 1000000000ULL / elapsed;
+        (context->received_packets * NANOS_PER_SECOND) / elapsed;
     if (rate > context->pps) {
         rate = context->pps;
     }
@@ -466,26 +468,50 @@ static int
 throttled_receive(Context * const context)
 {
     unsigned long long       now = get_nanoseconds(), now2;
+    int                      remaining_ms;
+
+    /* elapsed ns since start */
     const unsigned long long elapsed = now - context->startup_date;
+
+    /* our target rate in nanoseconds per packet */
+    const unsigned long long npp = NANOS_PER_SECOND / context->pps;
+
+    /*
+     * the amount of time we would have expected to pass if we were 
+     * actually sending at the target rate
+     */
+    const unsigned long long target_elapsed_for_packets =
+      context->sent_packets * npp;
+
+    /* the max number of packets we should have seen since start */
     const unsigned long long max_packets =
-        context->pps * elapsed / 1000000000UL;
+      (context->pps * elapsed) / NANOS_PER_SECOND;
 
     if (context->sending == 1 && context->sent_packets <= max_packets) {
         empty_receive_queue(context, 0);
     }
-    const unsigned long long excess =  (context->sent_packets > max_packets) ?
-      (context->sent_packets - max_packets) : 0;
-    const unsigned long long time_to_wait = excess / context->pps;
+
     unsigned long long diff;
     int packets;
-    unsigned long long remaining_time_ns = time_to_wait;
+    unsigned long long remaining_time_ns =
+      (elapsed >= target_elapsed_for_packets) ? 0 :
+      (target_elapsed_for_packets - elapsed);
 
     if (context->sending == 0) {
-        remaining_time_ns = 2000000000ULL;
+        /*
+	 * don't wait forever because packets may not actually return to us,
+         * especially if we're using the -R flag with IPs that we don't own
+         */
+        remaining_time_ns = 2 * NANOS_PER_SECOND;
     }
 
     do {
-        packets = receive(context, (int) (remaining_time_ns / 1000000ULL));
+        remaining_ms = (int) (remaining_time_ns / 1000000ULL);
+	if (remaining_ms <= 0) {
+	  break;
+	}
+
+        packets = receive(context, remaining_ms);
 	if (packets > 0) {
 	    periodically_update_status(context);
 	}
@@ -573,7 +599,7 @@ main(int argc, char *argv[])
 	  exit(1);
 	}
 	pps = strtoul(optarg, &endptr, 10);
-	if (*endptr != '\0') {
+	if ((*endptr != '\0') || (pps < 1)) {
 	  fprintf(stderr, "invalid rate for -r flag\n");
 	  exit(1);
 	}
