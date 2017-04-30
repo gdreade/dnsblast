@@ -4,6 +4,9 @@
 /* this needs the leading dot */
 static const char * domain_name = DEFAULT_DOMAIN;
 
+static int
+get_sock(const char * const host, const char * const port,
+         struct addrinfo ** const ai_ref);
 
 static unsigned long long
 get_nanoseconds(void)
@@ -14,15 +17,39 @@ get_nanoseconds(void)
     return tv.tv_sec * 1000000000LL + tv.tv_usec * 1000LL;
 }
 
+static void
+clear_context(Context * const context) {
+  unsigned int i;
+
+  for (i = 0; i < context->senders_count; i++) {
+    if (context->sock_array[i] >= 0) {
+      close(context->sock_array[i]);
+    }
+    if (context->ai_array[i] != NULL) {
+      freeaddrinfo(context->ai_array[i]);
+    }
+  }
+  free(context->pollfds);
+  free(context->ai_array);
+  free(context->sock_array);
+}
+
 static int
-init_context(Context * const context, const int sock,
-             const struct addrinfo * const ai, const _Bool fuzz)
+init_context(Context * const context,
+	     const char *host,
+	     const char *port,
+	     const in_addr_t lowaddr,
+	     const in_addr_t highaddr,
+	     const _Bool fuzz)
 {
     const unsigned long long now = get_nanoseconds();
+    unsigned int i;
+    uint32_t lowNum, highNum;
+
     *context = (Context) {
         .received_packets = 0UL, .sent_packets = 0UL,
         .last_status_update = now, .startup_date = now,
-        .sock = sock, .ai = ai, .fuzz = fuzz, .sending = 1
+	.senders_count = 0, .current_sender = 0, .fuzz = fuzz, .sending = 1
     };
 
     DNS_Header * const question_header = (DNS_Header *) context->question;
@@ -30,6 +57,83 @@ init_context(Context * const context, const int sock,
         .flags = htons(FLAGS_OPCODE_QUERY | FLAGS_RECURSION_DESIRED),
         .qdcount = htons(1U), .ancount = 0U, .nscount = 0U, .arcount = 0U
     };
+
+    lowNum = ntohl(lowaddr);
+    highNum = ntohl(highaddr);
+    if ((lowNum == 0) && (highNum == 0)) {
+        context->senders_count = 1;
+    } else {
+        if (lowNum <= highNum) {
+	    context->senders_count = highNum - lowNum + 1;
+	} else {
+	    fprintf(stderr, "The second IP from the -R flag must not be "
+		    "smaller than the first IP\n");
+	    exit(EXIT_FAILURE);
+	}
+    }
+
+    context->sock_array = malloc(context->senders_count * sizeof(int));
+    if (context->sock_array == NULL) {
+        fprintf(stderr, "failed to allocate memory for %d file descriptors", 
+		context->senders_count);
+	exit(EXIT_FAILURE);
+    }
+    for (i=0; i < context->senders_count; i++) {
+      context->sock_array[i] = -1;
+    }
+
+    context->ai_array =
+      malloc(context->senders_count * sizeof(struct addrinfo *));
+    if (context->ai_array == NULL) {
+        fprintf(stderr,
+                "failed to allocate memory for %d addrinfo struct pointers", 
+                context->senders_count);
+	exit(EXIT_FAILURE);
+    }
+    memset(context->ai_array, 0,
+	   context->senders_count * sizeof(struct addrinfo *));
+
+    context->pollfds = malloc(context->senders_count * sizeof(struct pollfd));
+    if (context->pollfds == NULL) {
+        fprintf(stderr, 
+		"failed to allocate memory for %d pollfd structs",
+		context->senders_count);
+	exit(EXIT_FAILURE);
+    }
+    for (i = 0; i < context->senders_count; i++) {
+        context->pollfds[i].fd = -1;
+    }
+    
+    for (i = 0; i < context->senders_count; i++) {
+        context->sock_array[i] = get_sock(host, port, &(context->ai_array[i]));
+	if (context->sock_array[i] == -1) {
+	    fprintf(stderr, "failed to get socket %d: %s\n", i,
+		    strerror(errno));
+	    exit(EXIT_FAILURE);
+	}
+
+	if (context->senders_count > 1) {
+	    /* bind to a specific IP */
+	    in_addr_t addr = htonl(lowNum);
+
+	    struct sockaddr_in baddr;
+	    memset((char *)&baddr, 0, sizeof(baddr));
+	    baddr.sin_family = AF_INET;
+	    baddr.sin_addr.s_addr = htonl(lowNum);
+	    baddr.sin_port = htons(0);
+
+	    if (bind(context->sock_array[i], (struct sockaddr *) &baddr,
+		     sizeof(baddr)) < 0) {
+	        struct in_addr iaddr;
+		iaddr.s_addr = addr;
+		fprintf(stderr, "failed to bind to %s: %s\n", inet_ntoa(iaddr),
+			strerror(errno));
+		exit(EXIT_FAILURE);
+	    }
+	}
+
+	lowNum++;
+    }
 
     return 0;
 }
@@ -99,6 +203,8 @@ blast(Context * const context, const char * const name, const uint16_t type)
     unsigned char * const question_data = question + sizeof *question_header;
     const size_t          sizeof_question_data =
         sizeof question - sizeof *question_header;
+    int sock;
+    struct addrinfo *ai;
 
     question_header->id = context->id++;
     unsigned char *msg = question_data;
@@ -111,8 +217,15 @@ blast(Context * const context, const char * const name, const uint16_t type)
     if (context->fuzz != 0) {
         fuzz(question, packet_size);
     }
-    while (sendto(context->sock, question, packet_size, 0,
-                  context->ai->ai_addr, context->ai->ai_addrlen)
+
+    if ((context->current_sender) >= (context->senders_count)) {
+        context->current_sender = 0;
+    }
+
+    sock = context->sock_array[context->current_sender];
+    ai = context->ai_array[context->current_sender];
+
+    while (sendto(sock, question, packet_size, 0, ai->ai_addr, ai->ai_addrlen)
            != (ssize_t) packet_size) {
         if (errno != EAGAIN && errno != EINTR) {
             perror("sendto");
@@ -120,6 +233,10 @@ blast(Context * const context, const char * const name, const uint16_t type)
         }
     }
     context->sent_packets++;
+
+    if (context->senders_count > 1) {
+        context->current_sender += 1;
+    }
 
     return 0;
 }
@@ -129,11 +246,12 @@ usage(void) {
   fprintf(stderr,
 	  "\nUsage:\n"
 	  "\tdnsblast [-Fn] [-c <count>] [-d <domain_name>] [-p <port>]\n"
-	  "\t\t[-r <rate>] <host>\n");
+	  "\t\t[-r <rate>] [-R <lowIP:highIP>] <host>\n");
   fprintf(stderr, 
 	  "\twhere:\n"
-	  "\t\t-F\t\tuse fuzzing\n"
-	  "\t\t-c <count>\tquery count (default is MAX_INT)\n"
+	  "\t\t-h\t\tPrint this message\n"
+	  "\t\t-F\t\tUse fuzzing\n"
+	  "\t\t-c <count>\tQuery count (default is MAX_INT)\n"
 	  "\t\t-d <domain_name>\n"
 	  "\t\t\t\tAll queries will be for names under the\n"
 	  "\t\t\t\tspecified domain (must begin with a dot).\n"
@@ -141,6 +259,8 @@ usage(void) {
 	  "\t\t-n\t\tDo not wait to receive return packets.\n"
 	  "\t\t-p <port>\tdestination port number or name\n"
 	  "\t\t-r <rate>\trate in packets per second\n"
+	  "\t\t-R <lowIP>:<highIP>\tspecify a range of IPs from\n"
+	  "\t\t\t\twhich packets should be sent\n"
 	  "\tand:\n"
 	  "\t\t<host>\t\tIP or FQDN\n",
 	  DEFAULT_DOMAIN);
@@ -231,25 +351,71 @@ get_sock(const char * const host, const char * const port,
 #elif defined(IP_DONTFRAG)
     setsockopt(sock, IPPROTO_IP, IP_DONTFRAG, &(int[]) { 0 }, sizeof (int));
 #endif
+#if defined(IP_TRANSPARENT)
+    setsockopt(sock, SOL_IP, IP_TRANSPARENT, &(int[]) { 1 }, sizeof (int));
+#endif
+#if defined(IP_FREEBIND)
+    setsockopt(sock, SOL_IP, IP_FREEBIND, &(int[]) { 1 }, sizeof (int));
+#endif
+
     assert(ioctl(sock, FIONBIO, &flag) == 0);
 
     return sock;
 }
 
+/**
+ * Receive up to one packet per socket and throw them away.
+ *
+ * timeout is the maximum number of milliseconds that this call will
+ * wait for an incoming packet
+ *
+ * Returns the number of packets received
+ */
 static int
-receive(Context * const context)
+receive(Context * const context, int timeout)
 {
     unsigned char buf[MAX_UDP_DATA_SIZE];
 
-    while (recv(context->sock, buf, sizeof buf, 0) == (ssize_t) -1) {
-        if (errno == EAGAIN) {
-            return 1;
-        }
-        assert(errno == EINTR);
+    unsigned i;
+    int ready;
+    nfds_t pollcount = 0;
+    int packets = 0;
+    for (i=0; i < context->senders_count; i++) {
+      int fd = context->sock_array[i];
+      if (fd >= 0) {
+	context->pollfds[pollcount].fd = fd;
+	context->pollfds[pollcount].events = POLLIN;
+	context->pollfds[pollcount].revents = 0;
+	pollcount++;
+      }
     }
-    context->received_packets++;
 
-    return 0;
+    if (pollcount > 0) {
+      ready = poll(context->pollfds, pollcount, timeout);
+      if (ready > 0) {
+	for (i=0; i<pollcount; i++) {
+	  if (context->pollfds[i].revents & POLLIN) {
+	    ssize_t bytes = recv(context->pollfds[i].fd, buf, sizeof(buf), 0);
+	    if (bytes >= 0) {
+	      context->received_packets++;
+	      packets++;
+	    } else if ((errno != EAGAIN)
+		       && (errno != EWOULDBLOCK)
+		       && (errno != EINTR)) {
+	      perror("recv");
+	      exit(EXIT_FAILURE);
+	    }
+	  }
+	}
+      } else if (ready < 0) {
+	if ((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR)) {
+	  perror("poll");
+	  exit(EXIT_FAILURE);
+	}
+      }
+    }
+    
+    return packets;
 }
 
 static int
@@ -287,9 +453,9 @@ periodically_update_status(Context * const context)
 }
 
 static int
-empty_receive_queue(Context * const context)
+empty_receive_queue(Context * const context, int timeout)
 {
-    while (receive(context) == 0)
+    while (receive(context, timeout) > 0)
         ;
     periodically_update_status(context);
 
@@ -305,38 +471,34 @@ throttled_receive(Context * const context)
         context->pps * elapsed / 1000000000UL;
 
     if (context->sending == 1 && context->sent_packets <= max_packets) {
-        empty_receive_queue(context);
+        empty_receive_queue(context, 0);
     }
-    const unsigned long long excess = context->sent_packets - max_packets;
+    const unsigned long long excess =  (context->sent_packets > max_packets) ?
+      (context->sent_packets - max_packets) : 0;
     const unsigned long long time_to_wait = excess / context->pps;
-    int                      remaining_time = (int) (time_to_wait * 1000ULL);
-    int                      ret;
-    struct pollfd            pfd = { .fd = context->sock,
-                                     .events = POLLIN | POLLERR };
+    unsigned long long diff;
+    int packets;
+    unsigned long long remaining_time_ns = time_to_wait;
+
     if (context->sending == 0) {
-        remaining_time = -1;
-    } else if (remaining_time < 0) {
-        remaining_time = 0;
+        remaining_time_ns = 2000000000ULL;
     }
+
     do {
-        ret = poll(&pfd, (nfds_t) 1, remaining_time);
-        if (ret == 0) {
-            periodically_update_status(context);
-            return 0;
-        }
-        if (ret == -1) {
-            if (errno != EAGAIN && errno != EINTR) {
-                perror("poll");
-                exit(EXIT_FAILURE);
-            }
-            continue;
-        }
-        assert(ret == 1);
-        empty_receive_queue(context);
+        packets = receive(context, (int) (remaining_time_ns / 1000000ULL));
+	if (packets > 0) {
+	    periodically_update_status(context);
+	}
+
         now2 = get_nanoseconds();
-        remaining_time -= (now2 - now) / 1000;
+
+	diff = (now2 - now);
+
+	remaining_time_ns = (remaining_time_ns > diff) ?
+	  (remaining_time_ns - diff) : 0;
+
         now = now2;
-    } while (remaining_time > 0);
+    } while (remaining_time_ns > 0);
 
     return 0;
 }
@@ -346,19 +508,18 @@ main(int argc, char *argv[])
 {
     char             name[100U] = ".";
     Context          context;
-    struct addrinfo *ai;
     const char      *host;
     const char      *port = "domain";
     unsigned long    pps        = ULONG_MAX;
     unsigned long    send_count = ULONG_MAX;
-    int              sock;
     uint16_t         type;
     _Bool            fuzz = 0;
     int              ch;
     char             *endptr;
     int              do_receive = 1;
+    in_addr_t        lowaddr = 0, highaddr = 0;
 
-    while ((ch = getopt(argc, argv, "c:d:Fnp:r:")) != -1) {
+    while ((ch = getopt(argc, argv, "c:d:Fhnp:r:R:")) != -1) {
       switch (ch) {
       case 'c':
         if ((optarg == NULL) || (*optarg == '\0')) {
@@ -389,6 +550,10 @@ main(int argc, char *argv[])
 	fuzz = 1;
 	break;
 
+      case 'h':
+	usage();
+	break;
+
       case 'n':
 	do_receive = 0;
 	break;
@@ -414,6 +579,32 @@ main(int argc, char *argv[])
 	}
 	break;
 
+      case 'R':
+        if ((optarg == NULL) || (*optarg == '\0')) {
+	  fprintf(stderr, "-R flag requires a range\n");
+	  exit(1);
+	} else {
+	  const char *delim = ":";
+	  char *pair = strdup(optarg);
+	  char *high = NULL;
+	  char *low = strtok(pair, delim);
+	  if (low != NULL) {
+	    high = strtok(NULL, delim);
+	  }
+	  if ((low == NULL) || (high == NULL)) {
+	    fprintf(stderr, "Invalid range for -R flag\n");
+	    exit(1);
+	  }
+	  lowaddr = inet_addr(low);
+	  highaddr = inet_addr(high);
+	  if ((lowaddr == INADDR_NONE) || (highaddr == INADDR_NONE)) {
+	    fprintf(stderr,
+		    "Invalid range for -R flag (only IPv4 is supported)\n");
+	    exit(1);
+	  }
+	}
+	break;
+
       default:
 	usage();
       }
@@ -426,11 +617,7 @@ main(int argc, char *argv[])
     }
     host = argv[0];
 
-    if ((sock = get_sock(host, port, &ai)) == -1) {
-        perror("Oops");
-        exit(EXIT_FAILURE);
-    }
-    init_context(&context, sock, ai, fuzz);
+    init_context(&context, host, port, lowaddr, highaddr, fuzz);
     context.pps = pps;
     srand(0U);
     assert(send_count > 0UL);
@@ -441,19 +628,16 @@ main(int argc, char *argv[])
         type = get_random_type();
         blast(&context, name, type);
 	if (do_receive) {
-	  throttled_receive(&context); 
-	}
+            throttled_receive(&context); 
+        }
     } while (--send_count > 0UL);
     update_status(&context);
 
     context.sending = 0;
     if (do_receive) {
-      while (context.sent_packets != context.received_packets) {
-        throttled_receive(&context);
-      }
+      throttled_receive(&context);
     }
-    freeaddrinfo(ai);
-    assert(close(sock) == 0);
+    clear_context(&context);
     update_status(&context);
     putchar('\n');
 

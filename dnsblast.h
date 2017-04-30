@@ -3,6 +3,7 @@
 #define __DNSBLAST_H__ 1
 
 #define _POSIX_C_SOURCE 200112L
+#define _BSD_SOURCE
 
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -12,6 +13,7 @@
 
 #include <netdb.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <assert.h>
 #include <errno.h>
@@ -44,13 +46,18 @@
 
 typedef struct Context_ {
     unsigned char          question[MAX_UDP_DATA_SIZE];
-    const struct addrinfo *ai;
     unsigned long long     last_status_update;
     unsigned long long     startup_date;
     unsigned long          pps;
     unsigned long          received_packets;
     unsigned long          sent_packets;
-    int                    sock;
+    int                   *sock_array;
+    struct addrinfo      **ai_array;
+    struct pollfd         *pollfds;
+    unsigned int           senders_count;
+    unsigned int           current_sender;
+    in_addr_t              low_addr;
+    in_addr_t              high_addr;
     uint16_t               id;
     _Bool                  fuzz;
     _Bool                  sending;
