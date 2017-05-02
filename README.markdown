@@ -34,7 +34,8 @@ What it does:
 It sends queries for names like
 `<random char><random char><random char><random char>.com`.
 
-Yes, that's 4 random characters dot com. Doing that achieves a
+Yes, that's 4 random characters dot com (or with another domain if
+you so specify). Doing that achieves a
 NXDOMAIN vs "oh cool, we got a reply" ratio that is surprisingly close
 to the one you get from real queries made by real users.
 
@@ -88,29 +89,39 @@ gets tested on OSX and OpenBSD.
 How do I use it?
 ----------------
 
+Read the man page.  However, some examples follow for the curious.
+
 To send a shitload of queries to 127.0.0.1:
 
     dnsblast 127.0.0.1
 
 To send 50,000 queries to 127.0.0.1:
 
-    dnsblast 127.0.0.1 50000
+    dnsblast -c 50000 127.0.0.1
 
 To send 50,000 queries at a rate of 100 queries per second:
 
-    dnsblast 127.0.0.1 50000 100
+    dnsblast -c 50000 -r 100 127.0.0.1
 
 To send 50,000 queries at a rate of 100 qps to a non standard-port, like 5353:
 
-    dnsblast 127.0.0.1 50000 100 5353
+    dnsblast -c 50000 -r 100 -p 5353 127.0.0.1
 
-To send malformed packets, prepend "fuzz":
+To send malformed packets, use the -F ("fuzz") flag:
 
-    dnsblast fuzz 127.0.0.1
-    dnsblast fuzz 127.0.0.1 50000
-    dnsblast fuzz 127.0.0.1 50000 100
-    dnsblast fuzz 127.0.0.1 50000 100 5353
+    dnsblast -F 127.0.0.1
 
-If you think that it desperately cries for `getopt()`, you're
-absolutely correct.
+To use a different domain for the queries, which can be useful if you
+want to run this against an authoritive nameserver without impacting 
+anything else on the Internet, try the following.  Note the leading
+dot on the domain name:
 
+    dnsblast -d .example.com 127.0.0.1
+
+To send from a range of IPs (IPv4 only):
+
+    dnsblast -R 192.168.99.201:192.168.99.220 127.0.0.1
+
+Note that for that last one, you either have to have those source IPs
+associated with your machine or you have to run as root and be on an
+operating system that supports binding to non-local IPs.

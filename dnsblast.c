@@ -23,6 +23,13 @@ static void
 clear_context(Context * const context) {
   unsigned int i;
 
+  for (i = 0; i < COMMAND_CHANNELS; i++) {
+    if (context->command_fds[i].fd >= 0) {
+      close(context->command_fds[i].fd);
+      context->command_fds[i].fd = -1;
+    }
+  }
+
   for (i = 0; i < context->senders_count; i++) {
     if (context->sock_array[i] >= 0) {
       close(context->sock_array[i]);
@@ -51,6 +58,7 @@ init_context(Context * const context,
     *context = (Context) {
         .received_packets = 0UL, .sent_packets = 0UL,
         .last_status_update = now, .startup_date = now,
+	.socket_path = NULL, .command_listen_socket = -1,
 	.senders_count = 0, .current_sender = 0, .fuzz = fuzz, .sending = 1
     };
 
@@ -59,6 +67,14 @@ init_context(Context * const context,
         .flags = htons(FLAGS_OPCODE_QUERY | FLAGS_RECURSION_DESIRED),
         .qdcount = htons(1U), .ancount = 0U, .nscount = 0U, .arcount = 0U
     };
+
+    for (i=0; i < COMMAND_CHANNELS; i++) {
+      context->command_fds[i].fd = -1;
+      context->command_fds[i].events = POLLIN | POLLOUT | POLLERR | POLLHUP;
+
+      context->command_bufs[i].inbuf_length = 0;
+      context->command_bufs[i].outbuf_pending = 0;
+    }
 
     lowNum = ntohl(lowaddr);
     highNum = ntohl(highaddr);
@@ -262,6 +278,8 @@ usage(void) {
 	  "\t\t-p <port>\tdestination port number or name\n"
 	  "\t\t-r <rate>\trate in packets per second\n"
 	  "\t\t-R <lowIP>:<highIP>\tspecify a range of IPs from\n"
+	  "\t\t-S <path>\tListen for commands on the specified\n"
+	  "\t\t\t\tpath, for which a UNIX socket will be created\n"
 	  "\t\t\t\twhich packets should be sent\n"
 	  "\tand:\n"
 	  "\t\t<host>\t\tIP or FQDN\n",
@@ -360,7 +378,10 @@ get_sock(const char * const host, const char * const port,
     setsockopt(sock, SOL_IP, IP_FREEBIND, &(int[]) { 1 }, sizeof (int));
 #endif
 
-    assert(ioctl(sock, FIONBIO, &flag) == 0);
+    if (ioctl(sock, FIONBIO, &flag) != 0) {
+      perror("failed to set non-blocking state on UDP sending socket");
+      exit(EXIT_FAILURE);
+    }
 
     return sock;
 }
@@ -455,6 +476,234 @@ periodically_update_status(Context * const context)
 }
 
 static int
+append_command_output(CommandBuffer *cbuf, const char *output) 
+{
+  size_t len = strlen(output);
+
+  if (cbuf->outbuf_pending + len + 1 > COMMAND_BUFFER_LEN) {
+    fprintf(stderr, "no space for response (dropped): %s\n", output);
+    return -1;
+  }
+
+  char *p = cbuf->outbuf + cbuf->outbuf_pending;
+  memcpy(p, output, len + 1);
+  cbuf->outbuf_pending += len;
+  return 0;
+}
+
+#define RESPONSE_BUFFER_SIZE 512
+
+static void 
+process_command (Context * const context, CommandBuffer *cbuf, char *command) 
+{
+  char buffer[RESPONSE_BUFFER_SIZE];
+
+  if (strcmp(command, "rate\n") == 0) {
+    /* rate query */
+    snprintf(buffer, RESPONSE_BUFFER_SIZE, "%lu\n", context->pps);
+    append_command_output(cbuf, buffer);
+
+  } else if (strncmp(command, "rate ", 5) == 0) {
+    char *endptr;
+    char *p = command + 5;
+
+    unsigned long newval = strtoul(p, &endptr, 10);
+    if (*endptr == '\n') {
+      if ((newval == ULONG_MAX) && (errno == ERANGE)) {
+	/* overflow, but just force it to the max */
+	newval = ULONG_MAX;
+      }
+      printf("rate changed from %lu to %lu\n", context->pps, newval);
+      context->pps = newval;
+      append_command_output(cbuf, "ok\n");
+    } else {
+      append_command_output(cbuf, "invalid_rate\n");
+    }
+  } else {
+    append_command_output(cbuf, "nack\n");
+  }
+}
+
+/**
+ * If the read buffer contains a newline, this function will extract one
+ * line of the command, shift the read buffer contents, and pass the extracted
+ * line off to process_command.
+ *
+ * If the read buffer does not contain a newline, this is a no-op.
+ */
+static void
+handle_read_buffer(Context * const context, CommandBuffer *cbuf)
+{
+  char line[COMMAND_BUFFER_LEN];
+  char *p, *q;
+  unsigned int remaining = cbuf->inbuf_length;
+
+  assert(remaining + 1 < COMMAND_BUFFER_LEN);
+
+  p = line;
+  q = cbuf->inbuf;
+
+  while (remaining > 0) {
+    *p++ = *q++;
+    --remaining;
+    if (*(p-1) == '\n') {
+      *p = '\0';
+
+      memmove(cbuf->inbuf, q, remaining);
+      cbuf->inbuf_length = remaining;
+      process_command(context, cbuf, line);
+      return;
+    }
+  }
+
+}
+
+static int
+read_and_handle(Context * const context, int fd, CommandBuffer *cbuf)
+{
+  if (cbuf->inbuf_length + 1 >= COMMAND_BUFFER_LEN) {
+    /* not enough space; wait for next time */
+    return 0;
+  }
+
+  size_t available_bytes = COMMAND_BUFFER_LEN - cbuf->inbuf_length - 1;
+  char *p = cbuf->inbuf + cbuf->inbuf_length;
+
+  ssize_t bytes = read(fd, p, available_bytes);
+  if (bytes < 0) {
+    if ((errno == EAGAIN) || (errno == EWOULDBLOCK) || (errno = EINTR)) {
+      return 0;
+    }
+    fprintf(stderr, "write error on fd %d: %s (closing socket)\n", fd,
+	    strerror(errno));
+    return -1;
+  }
+
+  /* always force null termination */
+  p[bytes] = '\0';
+
+  cbuf->inbuf_length += bytes;
+
+  handle_read_buffer(context, cbuf);
+
+  return 0;
+}
+
+static int
+write_and_handle(int fd, CommandBuffer *cbuf)
+{
+  ssize_t bytes = write(fd, cbuf->outbuf, cbuf->outbuf_pending);
+  if (bytes < 0) {
+    if ((errno == EAGAIN) || (errno == EWOULDBLOCK) || (errno = EINTR)) {
+      return 0;
+    }
+    fprintf(stderr, "write error on fd %d: %s (closing socket)\n", fd,
+	    strerror(errno));
+    return -1;
+  }
+
+  unsigned int remaining = cbuf->outbuf_pending - bytes;
+
+  /* one extra for a null byte */
+  if (remaining > 0) {
+    char *p = cbuf->outbuf + bytes;
+    memmove(cbuf->outbuf, p, remaining + 1);
+  }
+  cbuf->outbuf_pending = remaining;
+
+  return 0;
+}
+
+static void
+check_for_commands(Context * const context)
+{
+  int i, res;
+  int available_channels = 0;
+  int poll_timeout_ms = (context->pps > 0) ? 0 : 250;
+
+  if (context->command_listen_socket < 0) {
+    /* not using this feature */
+    if (context->pps == 0) {
+      fprintf(stderr, "early exit: you have a zero rate and the command "
+	      "socket is not in use\n");
+      exit(EXIT_FAILURE);
+    }
+    return;
+  }
+
+  for (i=0; i < COMMAND_CHANNELS; i++) {
+    context->command_fds[i].revents = 0;
+  }
+
+  res = poll(context->command_fds, COMMAND_CHANNELS, poll_timeout_ms);
+  if (res < 0) {
+    if (errno == EINTR) {
+      return;
+    }
+    perror("poll on command channels");
+    exit(EXIT_FAILURE);
+  } else if (res > 0) {
+    for (i = 0; i < COMMAND_CHANNELS; i++) {
+      struct pollfd * pfd= &(context->command_fds[i]);
+      CommandBuffer *cbuf = &(context->command_bufs[i]);
+
+      if (pfd->fd >= 0) {
+	if (pfd->revents & POLLIN) {
+	  if (read_and_handle(context, pfd->fd, cbuf) < 0) {
+	    close(pfd->fd);
+	    pfd->fd = -1;
+	  }
+	}
+	if ((pfd->revents & POLLOUT) && (cbuf->outbuf_pending > 0)) {
+	  if (write_and_handle(pfd->fd, cbuf) < 0) {
+	    close(pfd->fd);
+	    pfd->fd = -1;
+	  }
+	}
+	if (pfd->revents & (POLLERR | POLLHUP)) {
+	  close(pfd->fd);
+	  pfd->fd = -1;
+	}
+      }
+    }
+  }
+
+  for (i = 0; i < COMMAND_CHANNELS; i++) {
+    if (context->command_fds[i].fd < 0) {
+      available_channels++;
+    }
+  }
+  
+  if (available_channels > 0) {
+    struct sockaddr_un remote;
+    socklen_t remotelen = sizeof(remote);
+    int s = accept(context->command_listen_socket,
+		   (struct sockaddr *) &remote, &remotelen);
+    if (s < 0) {
+      if ((errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR)) {
+	perror("accept on command listening socket failed");
+	exit(EXIT_FAILURE);
+      } else if (poll_timeout_ms > 0) {
+	/* 
+	 * either absolutely nothing going on, or we have a connected
+	 * remote that isn't sending anything
+	 */
+	usleep(poll_timeout_ms * 1000ULL);
+      }
+
+    } else {
+      /* find a slot */
+      for (i = 0; i < COMMAND_CHANNELS; i++) {
+	if (context->command_fds[i].fd < 0) {
+	  context->command_fds[i].fd = s;
+	  break;
+	}
+      }
+    }
+  }
+}
+
+static int
 empty_receive_queue(Context * const context, int timeout)
 {
     while (receive(context, timeout) > 0)
@@ -473,8 +722,9 @@ throttled_receive(Context * const context)
     /* elapsed ns since start */
     const unsigned long long elapsed = now - context->startup_date;
 
-    /* our target rate in nanoseconds per packet */
-    const unsigned long long npp = NANOS_PER_SECOND / context->pps;
+    /* our target rate in nanoseconds per packet; watch for zero pps */
+    const unsigned long long npp = (context->pps > 0) ?
+      (NANOS_PER_SECOND / context->pps) : NANOS_PER_SECOND;
 
     /*
      * the amount of time we would have expected to pass if we were 
@@ -484,8 +734,8 @@ throttled_receive(Context * const context)
       context->sent_packets * npp;
 
     /* the max number of packets we should have seen since start */
-    const unsigned long long max_packets =
-      (context->pps * elapsed) / NANOS_PER_SECOND;
+    const unsigned long long max_packets = (context->pps > 0) ?
+      ((context->pps * elapsed) / NANOS_PER_SECOND) : 1;
 
     if (context->sending == 1 && context->sent_packets <= max_packets) {
         empty_receive_queue(context, 0);
@@ -529,6 +779,79 @@ throttled_receive(Context * const context)
     return 0;
 }
 
+static void
+setup_socket(Context * const context)
+{
+  struct stat sbuf;
+  struct sockaddr_un local;
+  int flag = 1;
+  int s;
+
+  if (context->socket_path == NULL) {
+    return;
+  }
+
+  size_t len = strlen(context->socket_path);
+  if (len >= sizeof(local.sun_path)) {
+    fprintf(stderr, "socket path is too long (%lu bytes > max of %lu)\n",
+	    len, sizeof(local.sun_path) - 1);
+    exit(EXIT_FAILURE);
+  }
+
+  s = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (s < 0) {
+    perror("failed to create socket");
+    exit(EXIT_FAILURE);
+  }
+
+  if (ioctl(s, FIONBIO, &flag) != 0) {
+    perror("failed to set non-blocking state on command listening socket");
+    exit(EXIT_FAILURE);
+  }
+
+  /* sanity tests on an existing socket path, if any */
+  if (stat(context->socket_path, &sbuf) == 0) {
+    if (S_ISSOCK(sbuf.st_mode)) {
+      if (unlink(context->socket_path) != 0) {
+	fprintf(stderr, "failed to unlink %s: %s\n", context->socket_path,
+		strerror(errno));
+	exit(EXIT_FAILURE);
+      }
+    } else {
+      fprintf(stderr, "%s exists but is not a socket\n", context->socket_path);
+      exit(EXIT_FAILURE);
+    }
+  } else if (errno != ENOENT) {
+    fprintf(stderr, "failed to stat %s: %s\n", context->socket_path,
+	    strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+  
+  memset(&local, 0, sizeof(struct sockaddr_un));
+  local.sun_family = AF_UNIX;
+  strncpy(local.sun_path, context->socket_path, sizeof(local.sun_path) - 1);
+
+  if (bind(s, (struct sockaddr *) &local, sizeof(local.sun_path)) < 0) {
+    fprintf(stderr, "failed to bind socket at %s: %s\n",
+	    context->socket_path, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
+  if (chmod(context->socket_path, 0777) < 0) {
+    fprintf(stderr, "failed to chmod %s: %s\n", context->socket_path,
+	    strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
+  if (listen(s, LISTEN_BACKLOG) < 0) {
+    fprintf(stderr, "failed to listen on socket at %s: %s\n",
+	    context->socket_path, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+
+  context->command_listen_socket = s;
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -536,6 +859,7 @@ main(int argc, char *argv[])
     Context          context;
     const char      *host;
     const char      *port = "domain";
+    const char      *socket_path = NULL;
     unsigned long    pps        = ULONG_MAX;
     unsigned long    send_count = ULONG_MAX;
     uint16_t         type;
@@ -545,7 +869,7 @@ main(int argc, char *argv[])
     int              do_receive = 1;
     in_addr_t        lowaddr = 0, highaddr = 0;
 
-    while ((ch = getopt(argc, argv, "c:d:Fhnp:r:R:")) != -1) {
+    while ((ch = getopt(argc, argv, "c:d:Fhnp:r:R:S:")) != -1) {
       switch (ch) {
       case 'c':
         if ((optarg == NULL) || (*optarg == '\0')) {
@@ -599,7 +923,7 @@ main(int argc, char *argv[])
 	  exit(1);
 	}
 	pps = strtoul(optarg, &endptr, 10);
-	if ((*endptr != '\0') || (pps < 1)) {
+	if (*endptr != '\0') {
 	  fprintf(stderr, "invalid rate for -r flag\n");
 	  exit(1);
 	}
@@ -631,6 +955,15 @@ main(int argc, char *argv[])
 	}
 	break;
 
+      case 'S':
+	if ((optarg == NULL) || (*optarg == '\0')) {
+	  fprintf(stderr, "-S flag requires a pathname\n");
+	  exit(1);
+	} else {
+	  socket_path = optarg;
+	}
+	break;
+
       default:
 	usage();
       }
@@ -644,20 +977,27 @@ main(int argc, char *argv[])
     host = argv[0];
 
     init_context(&context, host, port, lowaddr, highaddr, fuzz);
+    context.socket_path = socket_path;
+    setup_socket(&context);
     context.pps = pps;
     srand(0U);
     assert(send_count > 0UL);
     do {
-        if (rand() > REPEATED_NAME_PROBABILITY) {
-            get_random_name(name, sizeof name);
+        if (context.pps > 0) {
+	    if (rand() > REPEATED_NAME_PROBABILITY) {
+	        get_random_name(name, sizeof name);
+	    }
+	    type = get_random_type();
+	    blast(&context, name, type);
         }
-        type = get_random_type();
-        blast(&context, name, type);
-	/* 
-	 * we need to do throttled_receive there even if do_receive is zero
-	 * because it is how we control the rate
-	 */
-	throttled_receive(&context); 
+	check_for_commands(&context);
+        if (context.pps > 0) {
+	    /* 
+	     * we need to do throttled_receive there even if do_receive is zero
+	     * because it is how we control the rate
+	     */
+	    throttled_receive(&context); 
+	}
     } while (--send_count > 0UL);
     update_status(&context);
 

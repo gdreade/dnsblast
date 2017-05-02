@@ -9,7 +9,9 @@
 #include <sys/ioctl.h>
 #include <sys/poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/un.h>
 
 #include <netdb.h>
 #include <netinet/in.h>
@@ -39,10 +41,23 @@
 # define MAX_UDP_BUFFER_SIZE  (16 * 1024 * 1024)
 #endif
 
+#define LISTEN_BACKLOG 5
+
+#define COMMAND_CHANNELS 5
+
+#define COMMAND_BUFFER_LEN 64
+
 #define DEFAULT_DOMAIN ".com"
 
 #define REPEATED_NAME_PROBABILITY (int) ((RAND_MAX * 13854LL) / 100000LL)
 #define REFUZZ_PROBABILITY (int) ((RAND_MAX * 500LL) / 100000LL)
+
+typedef struct CommandBuffer_ {
+  char inbuf[COMMAND_BUFFER_LEN];
+  char outbuf[COMMAND_BUFFER_LEN];
+  unsigned int inbuf_length;
+  unsigned int outbuf_pending;
+} CommandBuffer;
 
 typedef struct Context_ {
     unsigned char          question[MAX_UDP_DATA_SIZE];
@@ -51,13 +66,17 @@ typedef struct Context_ {
     unsigned long          pps;
     unsigned long          received_packets;
     unsigned long          sent_packets;
+    const char            *socket_path;
     int                   *sock_array;
     struct addrinfo      **ai_array;
     struct pollfd         *pollfds;
+    struct pollfd          command_fds[COMMAND_CHANNELS];
+    CommandBuffer          command_bufs[COMMAND_CHANNELS];
     unsigned int           senders_count;
     unsigned int           current_sender;
     in_addr_t              low_addr;
     in_addr_t              high_addr;
+    int                    command_listen_socket;
     uint16_t               id;
     _Bool                  fuzz;
     _Bool                  sending;
