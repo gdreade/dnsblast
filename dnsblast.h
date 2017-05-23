@@ -63,9 +63,11 @@ typedef struct Context_ {
     unsigned char          question[MAX_UDP_DATA_SIZE];
     unsigned long long     last_status_update;
     unsigned long long     startup_date;
+    unsigned long long     reset_date;
     unsigned long          pps;
     unsigned long          received_packets;
     unsigned long          sent_packets;
+    unsigned long          sent_packets_since_reset;
     const char            *socket_path;
     int                   *sock_array;
     struct addrinfo      **ai_array;

@@ -57,7 +57,9 @@ init_context(Context * const context,
 
     *context = (Context) {
         .received_packets = 0UL, .sent_packets = 0UL,
+        .sent_packets_since_reset = 0UL,
         .last_status_update = now, .startup_date = now,
+	.reset_date = now,
 	.socket_path = NULL, .command_listen_socket = -1,
 	.senders_count = 0, .current_sender = 0, .fuzz = fuzz, .sending = 1
     };
@@ -251,6 +253,7 @@ blast(Context * const context, const char * const name, const uint16_t type)
         }
     }
     context->sent_packets++;
+    context->sent_packets_since_reset++;
 
     if (context->senders_count > 1) {
         context->current_sender += 1;
@@ -513,8 +516,10 @@ process_command (Context * const context, CommandBuffer *cbuf, char *command)
 	/* overflow, but just force it to the max */
 	newval = ULONG_MAX;
       }
-      printf("rate changed from %lu to %lu\n", context->pps, newval);
+      printf("\nrate changed from %lu to %lu\n", context->pps, newval);
       context->pps = newval;
+      context->sent_packets_since_reset = 0;
+      context->reset_date = get_nanoseconds();
       append_command_output(cbuf, "ok\n");
     } else {
       append_command_output(cbuf, "invalid_rate\n");
@@ -723,7 +728,7 @@ throttled_receive(Context * const context)
     int                      remaining_ms;
 
     /* elapsed ns since start */
-    const unsigned long long elapsed = now - context->startup_date;
+    const unsigned long long elapsed = now - context->reset_date;
 
     /* our target rate in nanoseconds per packet; watch for zero pps */
     const unsigned long long npp = (context->pps > 0) ?
@@ -734,9 +739,9 @@ throttled_receive(Context * const context)
      * actually sending at the target rate
      */
     const unsigned long long target_elapsed_for_packets =
-      context->sent_packets * npp;
+      context->sent_packets_since_reset * npp;
 
-    /* the max number of packets we should have seen since start */
+    /* the max number of packets we should have seen since reset */
     const unsigned long long max_packets = (context->pps > 0) ?
       ((context->pps * elapsed) / NANOS_PER_SECOND) : 1;
 
