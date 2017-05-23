@@ -699,6 +699,9 @@ check_for_commands(Context * const context)
 	  break;
 	}
       }
+      if (i == COMMAND_CHANNELS) {
+	fprintf(stderr, "no slots for fd %d (this shouldn't happen)\n", s);
+      }
     }
   }
 }
@@ -747,12 +750,15 @@ throttled_receive(Context * const context)
       (elapsed >= target_elapsed_for_packets) ? 0 :
       (target_elapsed_for_packets - elapsed);
 
-    if (context->sending == 0) {
+    /* We need to limit this or the command channel becomes nonresponsive */
+    unsigned long long max_ns = NANOS_PER_SECOND / 4;
+
+    if ((context->sending == 0) || (remaining_time_ns > max_ns)) {
         /*
 	 * don't wait forever because packets may not actually return to us,
          * especially if we're using the -R flag with IPs that we don't own
          */
-        remaining_time_ns = 2 * NANOS_PER_SECOND;
+        remaining_time_ns = max_ns;
     }
 
     do {
@@ -991,13 +997,12 @@ main(int argc, char *argv[])
 	    blast(&context, name, type);
         }
 	check_for_commands(&context);
-        if (context.pps > 0) {
-	    /* 
-	     * we need to do throttled_receive there even if do_receive is zero
-	     * because it is how we control the rate
-	     */
-	    throttled_receive(&context); 
-	}
+
+	/* 
+	 * we need to do throttled_receive there even if do_receive is zero
+	 * because it is how we control the rate
+	 */
+	throttled_receive(&context); 
     } while (--send_count > 0UL);
     update_status(&context);
 
