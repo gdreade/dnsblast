@@ -49,7 +49,8 @@ init_context(Context * const context,
 	     const char *port,
 	     const in_addr_t lowaddr,
 	     const in_addr_t highaddr,
-	     const _Bool fuzz)
+	     const _Bool fuzz,
+	     const _Bool quiet)
 {
     const unsigned long long now = get_nanoseconds();
     unsigned int i;
@@ -61,7 +62,7 @@ init_context(Context * const context,
         .last_status_update = now, .startup_date = now,
 	.reset_date = now,
 	.socket_path = NULL, .command_listen_socket = -1,
-	.senders_count = 0, .current_sender = 0, .fuzz = fuzz, .sending = 1
+	.senders_count = 0, .current_sender = 0, .fuzz = fuzz, .sending = 1, .quiet = quiet
     };
 
     DNS_Header * const question_header = (DNS_Header *) context->question;
@@ -279,11 +280,12 @@ usage(void) {
 	  "\t\t\t\tThe default is \"%s\"\n"
 	  "\t\t-n\t\tDo not wait to receive return packets.\n"
 	  "\t\t-p <port>\tdestination port number or name\n"
+	  "\t\t-q\t\tTry to perform the work quietly\n"
 	  "\t\t-r <rate>\trate in packets per second\n"
 	  "\t\t-R <lowIP>:<highIP>\tspecify a range of IPs from\n"
+	  "\t\t\t\twhich packets should be sent\n"
 	  "\t\t-S <path>\tListen for commands on the specified\n"
 	  "\t\t\t\tpath, for which a UNIX socket will be created\n"
-	  "\t\t\t\twhich packets should be sent\n"
 	  "\tand:\n"
 	  "\t\t<host>\t\tIP or FQDN\n",
 	  DEFAULT_DOMAIN);
@@ -454,12 +456,14 @@ update_status(const Context * const context)
     if (rate > context->pps) {
         rate = context->pps;
     }
-    printf("Sent: [%lu] - Received: [%lu] - Reply rate: [%llu pps] - "
-           "Ratio: [%.2f%%]  \r",
-           context->sent_packets, context->received_packets, rate,
-           (double) context->received_packets * 100.0 /
-           (double) context->sent_packets);
-    fflush(stdout);
+    if (!context->quiet) {
+        printf("Sent: [%lu] - Received: [%lu] - Reply rate: [%llu pps] - "
+	       "Ratio: [%.2f%%]  \r",
+	       context->sent_packets, context->received_packets, rate,
+	       (double) context->received_packets * 100.0 /
+	       (double) context->sent_packets);
+	fflush(stdout);
+    }
 
     return 0;
 }
@@ -516,7 +520,9 @@ process_command (Context * const context, CommandBuffer *cbuf, char *command)
 	/* overflow, but just force it to the max */
 	newval = ULONG_MAX;
       }
-      printf("\nrate changed from %lu to %lu\n", context->pps, newval);
+      if (!context->quiet) {
+	  printf("\nrate changed from %lu to %lu\n", context->pps, newval);
+      }
       context->pps = newval;
       context->sent_packets_since_reset = 0;
       context->reset_date = get_nanoseconds();
@@ -875,12 +881,13 @@ main(int argc, char *argv[])
     unsigned long    send_count = ULONG_MAX;
     uint16_t         type;
     _Bool            fuzz = 0;
+    _Bool            quiet = 0;
     int              ch;
     char             *endptr;
     int              do_receive = 1;
     in_addr_t        lowaddr = 0, highaddr = 0;
 
-    while ((ch = getopt(argc, argv, "c:d:Fhnp:r:R:S:")) != -1) {
+    while ((ch = getopt(argc, argv, "c:d:Fhnp:qr:R:S:")) != -1) {
       switch (ch) {
       case 'c':
         if ((optarg == NULL) || (*optarg == '\0')) {
@@ -925,6 +932,10 @@ main(int argc, char *argv[])
 	  exit(1);
 	}
 	port = optarg;
+	break;
+
+      case 'q':
+	quiet = 1;
 	break;
 
       case 'r':
@@ -987,7 +998,7 @@ main(int argc, char *argv[])
     }
     host = argv[0];
 
-    init_context(&context, host, port, lowaddr, highaddr, fuzz);
+    init_context(&context, host, port, lowaddr, highaddr, fuzz, quiet);
     context.socket_path = socket_path;
     setup_socket(&context);
     context.pps = pps;

@@ -82,6 +82,7 @@ typedef struct Context_ {
     uint16_t               id;
     _Bool                  fuzz;
     _Bool                  sending;
+    _Bool                  quiet;
 } Context;
 
 typedef struct WeightedType_ {
